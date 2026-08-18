@@ -576,6 +576,28 @@ def aux_progress_hook(hook):
 _aux_timing_hook = _aux_thread_local_hook
 
 
+@contextlib.contextmanager
+def aux_streamed_call():
+    """Run the enclosed aux LLM call(s) on the *streamed* path.
+
+    With a forward-progress hook active, :func:`_create_with_progress` sends
+    ``stream=True`` and the configured ``timeout`` acts as a per-read (idle)
+    deadline instead of a total-generation budget — so a SLOW but progressing
+    model (typical for local llama.cpp / vLLM backends) is not killed the
+    moment a single non-streaming response takes longer than ``timeout`` to
+    fully generate. The response is aggregated back into the same complete
+    object callers expect (``.choices[0].message.content``), and providers
+    that reject the streamed request fall back to a plain non-streaming call.
+
+    The installed hook is a no-op tick: there is no outer watchdog to extend
+    here, its only effect is to select the streaming path. It is a no-op for
+    clients that stream internally (Codex/Anthropic/Bedrock), which
+    ``_create_with_progress`` already handles without our help.
+    """
+    with aux_progress_hook(lambda: None):
+        yield
+
+
 def _run_protected_sync_provider_call(
     callback: Callable[[dict[str, Any]], Any],
     kwargs: dict[str, Any],

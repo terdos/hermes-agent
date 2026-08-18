@@ -162,7 +162,7 @@ def specify_task(
         )
 
     try:
-        from agent.auxiliary_client import call_llm
+        from agent.auxiliary_client import call_llm, aux_streamed_call  # type: ignore
     except Exception as exc:  # pragma: no cover — import smoke test
         logger.debug("specify: auxiliary client import failed: %s", exc)
         return SpecifyOutcome(task_id, False, "auxiliary client unavailable")
@@ -175,18 +175,23 @@ def specify_task(
 
     try:
         # Route through call_llm so auxiliary.triage_specifier.* config
-        # (provider/model/base_url, extra_body, reasoning_effort, retries)
-        # all apply — the direct-create path dropped extra_body (#35566).
-        resp = call_llm(
-            task="triage_specifier",
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.3,
-            max_tokens=HERMES_KANBAN_SPECIFY_MAX_TOKENS,
-            timeout=timeout or 120,
-        )
+        # (provider/model/base_url, extra_body, reasoning_effort, retries,
+        # timeout) all apply — the direct-create path dropped extra_body
+        # (#35566). timeout=None defers to the config value (hardcoding
+        # 120 here would silently override the user's value), and
+        # aux_streamed_call() turns that timeout into an idle deadline so
+        # slow local models aren't killed mid-generation.
+        with aux_streamed_call():
+            resp = call_llm(
+                task="triage_specifier",
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.3,
+                max_tokens=HERMES_KANBAN_SPECIFY_MAX_TOKENS,
+                timeout=timeout,
+            )
     except Exception as exc:
         logger.info(
             "specify: API call failed for %s (%s) — skipping",

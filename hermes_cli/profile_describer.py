@@ -210,7 +210,7 @@ def describe_profile(
         model, provider = None, None
 
     try:
-        from agent.auxiliary_client import call_llm  # type: ignore
+        from agent.auxiliary_client import call_llm, aux_streamed_call  # type: ignore
     except Exception as exc:
         logger.debug("describe: auxiliary client import failed: %s", exc)
         return DescribeOutcome(canon, False, "auxiliary client unavailable")
@@ -226,18 +226,22 @@ def describe_profile(
 
     try:
         # Route through call_llm so auxiliary.profile_describer.* config
-        # (provider/model/base_url, extra_body, reasoning_effort, retries)
-        # all apply — the direct-create path dropped extra_body (#35566).
-        resp = call_llm(
-            task="profile_describer",
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.3,
-            max_tokens=400,
-            timeout=timeout or 60,
-        )
+        # (provider/model/base_url, extra_body, reasoning_effort, retries,
+        # timeout) all apply — the direct-create path dropped extra_body
+        # (#35566). timeout=None defers to the config value, and
+        # aux_streamed_call() makes it an idle deadline so a slow local
+        # model isn't killed mid-generation.
+        with aux_streamed_call():
+            resp = call_llm(
+                task="profile_describer",
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.3,
+                max_tokens=400,
+                timeout=timeout,
+            )
     except Exception as exc:
         logger.info("describe: API call failed for %s (%s)", canon, exc)
         return DescribeOutcome(canon, False, f"LLM error: {type(exc).__name__}")

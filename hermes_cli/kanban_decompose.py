@@ -298,7 +298,7 @@ def decompose_task(
     roster, valid_names = _build_roster()
 
     try:
-        from agent.auxiliary_client import call_llm  # type: ignore
+        from agent.auxiliary_client import call_llm, aux_streamed_call  # type: ignore
     except Exception as exc:
         logger.debug("decompose: auxiliary client import failed: %s", exc)
         return DecomposeOutcome(task_id, False, "auxiliary client unavailable")
@@ -313,19 +313,31 @@ def decompose_task(
 
     try:
         # Route through call_llm so auxiliary.kanban_decomposer.* config
-        # (provider/model/base_url, extra_body, reasoning_effort, retries)
-        # all apply — the previous direct client.chat.completions.create()
+        # (provider/model/base_url, extra_body, reasoning_effort, retries,
+        # timeout) all apply — the previous direct client.chat.completions.create()
         # path dropped auxiliary.<task>.extra_body entirely (#35566).
-        resp = call_llm(
-            task="kanban_decomposer",
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.3,
-            max_tokens=4000,
-            timeout=timeout or 180,
-        )
+        #
+        # timeout=None defers to auxiliary.kanban_decomposer.timeout in
+        # config (hardcoding it here would silently override the user's
+        # value, which mattered for slow local models that need more than
+        # the 180s default to emit a task-graph JSON).
+        #
+        # aux_streamed_call() sends the request with stream=True so the
+        # configured timeout acts as an idle (per-read) deadline rather
+        # than a total-generation budget — a local llama.cpp/vLLM backend
+        # that needs several minutes to generate the graph is fine as long
+        # as tokens keep flowing, instead of dying at the fixed total.
+        with aux_streamed_call():
+            resp = call_llm(
+                task="kanban_decomposer",
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.3,
+                max_tokens=4000,
+                timeout=timeout,
+            )
     except Exception as exc:
         logger.info(
             "decompose: API call failed for %s (%s)", task_id, exc,

@@ -22,12 +22,14 @@ from agent.auxiliary_client import (
     _aggregate_chat_stream,
     _aggregate_chat_stream_async,
     _anthropic_event_has_content,
+    _aux_progress_active,
     _aux_stream_total_ceiling,
     _codex_event_has_content,
     _create_with_progress,
     _notify_aux_progress,
     _provider_requires_stream,
     aux_progress_hook,
+    aux_streamed_call,
 )
 from agent.conversation_compression import CompressionCommitFence
 
@@ -569,6 +571,77 @@ class TestForceStream:
             )
         # No silent non-streaming retry — the provider rejects those anyway.
         assert len(client.calls) == 1
+
+
+class TestAuxStreamedCall:
+    """aux_streamed_call — the escape hatch for aux tasks (kanban
+    decomposer / specifier, profile describer) that run against slow local
+    models. It must select the streamed path so the configured timeout acts
+    as an idle (per-read) deadline, not a total-generation budget."""
+
+    def test_streams_and_aggregates_without_explicit_hook(self):
+        chunks = [
+            _chunk(content='{"fan":'),
+            _chunk(content="out\": true}", finish_reason="stop"),
+        ]
+        client = _FakeClient(stream_chunks=chunks)
+        with aux_streamed_call():
+            result = _create_with_progress(
+                client, {"model": "m1", "messages": [], "timeout": 180},
+            )
+        # stream=True was sent and the response reassembled into a complete
+        # object with the same shape callers read (.choices[0].message.content).
+        assert client.calls[0]["stream"] is True
+        assert client.calls[0]["stream_options"] == {"include_usage": True}
+        assert result.choices[0].message.content == '{"fan":out": true}'
+
+    def test_without_context_manager_stays_non_streaming(self):
+        client = _FakeClient(response=_COMPLETE)
+        result = _create_with_progress(
+            client, {"model": "m1", "messages": []},
+        )
+        assert result is _COMPLETE
+        assert "stream" not in client.calls[0]
+
+    def test_hook_is_restored_on_exit_and_exception(self):
+        with aux_streamed_call():
+            assert _aux_progress_active()
+        assert not _aux_progress_active()
+        with pytest.raises(RuntimeError, match="boom"):
+            with aux_streamed_call():
+                raise RuntimeError("boom")
+        assert not _aux_progress_active()
+
+    def test_stream_rejection_falls_back_to_plain_call(self):
+        # Some local backends accept the request but reject stream=True —
+        # the plain non-streaming fallback keeps those working (they just
+        # get the old total-budget semantics).
+        client = _FakeClient(
+            response=_COMPLETE,
+            stream_error=RuntimeError("stream_options not supported"),
+        )
+        with aux_streamed_call():
+            result = _create_with_progress(
+                client, {"model": "m1", "messages": []},
+            )
+        assert result is _COMPLETE
+        assert len(client.calls) == 2
+        assert client.calls[0].get("stream") is True
+        assert "stream" not in client.calls[1]
+
+    def test_hook_does_not_leak_across_threads(self):
+        # The decomposer runs in the gateway's threadpool (asyncio.to_thread)
+        # and the dashboard's threadpool — thread-local isolation must hold.
+        seen = []
+
+        def _other_thread():
+            seen.append(_aux_progress_active())
+
+        with aux_streamed_call():
+            t = threading.Thread(target=_other_thread)
+            t.start()
+            t.join()
+        assert seen == [False]
 
 
 class TestAsyncStreamAggregation:

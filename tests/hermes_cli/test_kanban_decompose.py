@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.auxiliary_client import _aux_progress_active
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_decompose as decomp
 
@@ -48,6 +49,67 @@ def _patch_aux_client(content: str, *, model: str = "test-model"):
         "agent.auxiliary_client.call_llm",
         return_value=_fake_aux_response(content),
     )
+
+
+def _decompose_payload():
+    return jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Tightened",
+        "body": "Do it.",
+        "assignee": None,
+    })
+
+
+def test_decompose_passes_timeout_through_to_call_llm(kanban_home):
+    # The decomposer must NOT hardcode a timeout: passing timeout=None (or an
+    # explicit value) through to call_llm is what lets
+    # auxiliary.kanban_decomposer.timeout in config.yaml take effect. A
+    # hardcoded `timeout or 180` silently overrode the user's 1800s setting
+    # and made every decompose attempt burn exactly 180s then fail — on a
+    # slow local model that is a ~15-minute loop that can never succeed.
+    mock_fn = MagicMock(return_value=_fake_aux_response(_decompose_payload()))
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="x", triage=True)
+        with patch("agent.auxiliary_client.call_llm", mock_fn):
+            # Default: timeout must arrive as None (config decides).
+            assert decomp.decompose_task(tid, author="me").ok
+            assert mock_fn.call_args.kwargs.get("timeout") is None
+    finally:
+        for p in patches:
+            p.stop()
+
+
+def test_decompose_runs_on_streamed_path(kanban_home):
+    # Slow local backends need stream=True so the configured timeout acts as
+    # an idle (per-read) deadline rather than a total-generation budget. The
+    # decomposer installs aux_streamed_call() around the call_llm() — which is
+    # observable as an active aux progress hook on the calling thread at the
+    # moment call_llm runs.
+    active_during_call = []
+
+    def _spy(**kwargs):
+        active_during_call.append(_aux_progress_active())
+        return _fake_aux_response(_decompose_payload())
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="x", triage=True)
+        with patch("agent.auxiliary_client.call_llm", side_effect=_spy):
+            assert decomp.decompose_task(tid, author="me").ok
+    finally:
+        for p in patches:
+            p.stop()
+    assert active_during_call == [True]
+    # And the hook must not leak past the call.
+    assert not _aux_progress_active()
 
 
 def _patch_extra_body():
