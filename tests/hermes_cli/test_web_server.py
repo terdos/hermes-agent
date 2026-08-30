@@ -3715,7 +3715,9 @@ class TestThemeBootstrapCSS:
 
     def test_user_theme_renders_bundle_vars(self, tmp_path, monkeypatch):
         """Active user theme → style block with ONLY variable names the
-        bundle actually consumes (layerVars/typographyVars tokens)."""
+        bundle actually consumes (layerVars/typographyVars tokens), and the
+        FULL variable set (not just the four canvas vars) so nothing snaps
+        in after hydration."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         self._write_theme(tmp_path)
         from hermes_cli import web_server
@@ -3725,11 +3727,23 @@ class TestThemeBootstrapCSS:
         css = web_server._render_active_theme_bootstrap_css()
         assert css.startswith('<style id="hermes-theme-bootstrap">')
         assert css.endswith("</style>")
-        # Real bundle tokens (web/src/themes/context.tsx + index.css).
+        # Real bundle tokens (web/src/themes/themeVars.ts + index.css).
         assert "--background-base:#0a1628;" in css
         assert "--midground-base:#dbe4f0;" in css
         assert "--theme-font-sans:Inter, sans-serif;" in css
         assert "--theme-base-size:17px;" in css
+        # The full set: palette alpha vars, typography, and layout tokens the
+        # normaliser fills with defaults.
+        assert "--background:color-mix(in srgb, #0a1628 100%, transparent);" in css
+        assert "--background-alpha:1.0;" in css
+        assert "--midground:color-mix(in srgb, #dbe4f0 100%, transparent);" in css
+        assert "--foreground:color-mix(in srgb, #ffffff 0%, transparent);" in css
+        assert "--theme-font-mono:" in css
+        assert "--theme-base-size:17px;" in css
+        assert "--theme-line-height:1.55;" in css
+        assert "--radius:0.5rem;" in css
+        assert "--theme-spacing-mul:1;" in css
+        assert "--theme-density:comfortable;" in css
         # Names that do NOT exist in the bundle must not be emitted.
         for bogus in ("--color-background", "--color-midground",
                       "--font-sans:", "--font-base-size"):
@@ -3741,6 +3755,68 @@ class TestThemeBootstrapCSS:
         assert "font-size:var(--theme-base-size);" in css
         # No baked literal values in the html,body rule.
         assert "#0a1628" not in css.split("html,body")[1]
+
+    def test_user_theme_renders_full_vars_and_custom_css(self, tmp_path, monkeypatch):
+        """A feature-rich user theme (color overrides, component styles,
+        customCSS) renders EVERY variable applyTheme() would set, plus the
+        raw customCSS — the pieces the old four-var shim dropped, which is
+        what made the flash visible even when the canvas was right."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        themes_dir = tmp_path / "dashboard-themes"
+        themes_dir.mkdir(exist_ok=True)
+        (themes_dir / "rich.yaml").write_text(
+            "name: rich\n"
+            "label: Rich\n"
+            "palette:\n"
+            "  background:\n"
+            "    hex: \"#101020\"\n"
+            "  midground:\n"
+            "    hex: \"#c0d0ff\"\n"
+            "typography:\n"
+            "  fontSans: \"Inter, sans-serif\"\n"
+            "  baseSize: \"16px\"\n"
+            "layout:\n"
+            "  radius: \"0.75rem\"\n"
+            "  density: \"spacious\"\n"
+            "colorOverrides:\n"
+            "  card: \"#1a1a2e\"\n"
+            "  border: \"#3a3a55\"\n"
+            "  mutedForeground: \"#8888aa\"\n"
+            "seriesColors:\n"
+            "  inputTokenAccent: \"#112233\"\n"
+            "  outputTokenAccent: \"#33aa55\"\n"
+            "componentStyles:\n"
+            "  card:\n"
+            "    clipPath: \"inset(0 round 12px)\"\n"
+            "customCSS: |\n"
+            "  .vignette { display: none !important; }\n",
+            encoding="utf-8",
+        )
+        from hermes_cli import web_server
+        monkeypatch.setattr(
+            web_server, "load_config", lambda: {"dashboard": {"theme": "rich"}}
+        )
+        css = web_server._render_active_theme_bootstrap_css()
+        # Palette + typography + layout.
+        assert "--background-base:#101020;" in css
+        assert "--midground-base:#c0d0ff;" in css
+        assert "--theme-base-size:16px;" in css
+        assert "--radius:0.75rem;" in css
+        assert "--theme-spacing-mul:1.2;" in css
+        assert "--theme-density:spacious;" in css
+        # Color overrides → --color-* tokens.
+        assert "--color-card:#1a1a2e;" in css
+        assert "--color-border:#3a3a55;" in css
+        assert "--color-muted-foreground:#8888aa;" in css
+        # Series accents.
+        assert "--series-input-token:#112233;" in css
+        assert "--series-output-token:#33aa55;" in css
+        # Component styles → kebab-cased --component-* vars.
+        assert "--component-card-clip-path:inset(0 round 12px);" in css
+        # customCSS ships in the same <style> block, escaped, before the
+        # canvas rule (it must be live on first paint).
+        assert ".vignette { display: none !important; }" in css
+        assert css.index(".vignette") < css.index("html,body{")
 
 
 
@@ -3827,6 +3903,37 @@ class TestNormaliseThemeExtensions:
         }
         assert r["componentStyles"]["header"]["background"].startswith("linear-gradient")
         assert "rogueBucket" not in r["componentStyles"]
+
+    def test_series_colors_and_terminal_fields_preserved(self):
+        """seriesColors + terminalBackground/terminalForeground are part of the
+        theme model (the frontend consumes them in applyTheme) and must survive
+        normalisation — dropping them made Analytics/Models accents and the
+        /chat terminal colors reset to defaults on every theme apply."""
+        from hermes_cli.web_server import _normalise_theme_definition
+        r = _normalise_theme_definition({
+            "name": "t",
+            "seriesColors": {
+                "inputTokenAccent": "#001934",
+                "outputTokenAccent": "#0053fd",
+            },
+            "terminalBackground": "#f5f8fc",
+            "terminalForeground": "#170d02",
+        })
+        assert r["seriesColors"] == {
+            "inputTokenAccent": "#001934",
+            "outputTokenAccent": "#0053fd",
+        }
+        assert r["terminalBackground"] == "#f5f8fc"
+        assert r["terminalForeground"] == "#170d02"
+
+        # Unknown / non-string series keys are dropped; empty result omits
+        # the key entirely (the frontend falls back to its defaults).
+        r2 = _normalise_theme_definition({
+            "name": "t",
+            "seriesColors": {"bogus": "#123456", "outputTokenAccent": 42},
+        })
+        assert "seriesColors" not in r2
+        assert "terminalBackground" not in r2
 
 
 

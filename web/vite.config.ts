@@ -13,8 +13,43 @@ function compilerPreset() {
 }
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
+import { buildBootstrapScript } from "./src/themes/bootstrapScript";
 
 const BACKEND = process.env.HERMES_DASHBOARD_URL ?? "http://127.0.0.1:9119";
+
+/**
+ * Inline a pre-paint theme bootstrap `<script>` into `<head>` (build + dev)
+ * so the first paint already uses the active theme instead of the static
+ * Hermes Teal default baked into `index.css` — which otherwise flashes on
+ * every refresh until the JS bundle loads and `ThemeProvider` re-applies the
+ * stored theme.
+ *
+ * The script reads the active theme name (server-injected
+ * `window.__HERMES_ACTIVE_THEME__` when served by `hermes dashboard`, else
+ * localStorage) and applies the full `:root` variable set to
+ * `documentElement` synchronously, before first paint. It is generated from
+ * the same theme model + `themeVars()` the React provider uses, so its values
+ * are byte-identical to `applyTheme()` — the provider's mount-time
+ * re-application is a visual no-op, not a re-paint.
+ *
+ * User YAML themes are painted by the server-side critical-CSS shim
+ * (`hermes_cli/web_server.py::_render_active_theme_bootstrap_css`); the inline
+ * script skips them (it only knows built-ins).
+ */
+function hermesThemeBootstrap(): Plugin {
+  return {
+    name: "hermes:theme-bootstrap",
+    transformIndexHtml() {
+      return [
+        {
+          tag: "script",
+          injectTo: "head",
+          children: buildBootstrapScript(),
+        },
+      ];
+    },
+  };
+}
 
 /**
  * In production the Python `hermes dashboard` server injects a one-shot
@@ -30,6 +65,8 @@ function hermesDevToken(): Plugin {
   const TOKEN_RE = /window\.__HERMES_SESSION_TOKEN__\s*=\s*"([^"]+)"/;
   const EMBEDDED_RE =
     /window\.__HERMES_DASHBOARD_EMBEDDED_CHAT__\s*=\s*(true|false)/;
+  const ACTIVE_THEME_RE =
+    /window\.__HERMES_ACTIVE_THEME__\s*=\s*"([^"]*)"/;
 
   return {
     name: "hermes:dev-session-token",
@@ -48,13 +85,19 @@ function hermesDevToken(): Plugin {
         }
         const embeddedMatch = html.match(EMBEDDED_RE);
         const embeddedJs = embeddedMatch ? embeddedMatch[1] : "true";
+        // Same active-theme signal the production server injects, so the
+        // pre-paint bootstrap (hermesThemeBootstrap) paints the right theme
+        // in dev too instead of flashing Hermes Teal.
+        const activeThemeMatch = html.match(ACTIVE_THEME_RE);
+        const activeThemeJs = activeThemeMatch ? activeThemeMatch[1] : "default";
         return [
           {
             tag: "script",
             injectTo: "head",
             children:
               `window.__HERMES_SESSION_TOKEN__="${match[1]}";` +
-              `window.__HERMES_DASHBOARD_EMBEDDED_CHAT__=${embeddedJs};`,
+              `window.__HERMES_DASHBOARD_EMBEDDED_CHAT__=${embeddedJs};` +
+              `window.__HERMES_ACTIVE_THEME__="${activeThemeJs}";`,
           },
         ];
       } catch (err) {
@@ -73,6 +116,7 @@ export default defineConfig({
     react(),
     babel({ presets: [compilerPreset()] }),
     tailwindcss(),
+    hermesThemeBootstrap(),
     hermesDevToken(),
   ],
   resolve: {

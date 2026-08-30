@@ -17639,71 +17639,228 @@ def _normalise_prefix(raw: Optional[str]) -> str:
     return normalise_prefix(raw)
 
 
+def _theme_camel_to_kebab(s: str) -> str:
+    """camelCase → kebab-case (``clipPath`` → ``clip-path``). Mirrors
+    ``toKebab()`` in ``web/src/themes/themeVars.ts``."""
+    return re.sub(r"[A-Z]", lambda m: "-" + m.group(0).lower(), s)
+
+
+def _theme_layer_css_vars(name: str, layer: Any) -> list:
+    """Emit the three layer vars (``--<name>``, ``--<name>-base``,
+    ``--<name>-alpha``) for one palette layer. Mirrors ``layerVars()`` in
+    ``web/src/themes/themeVars.ts``. Values are NOT escaped here — callers
+    escape when assembling the final CSS text."""
+    if not isinstance(layer, dict):
+        return []
+    hex_val = layer.get("hex")
+    alpha_val = layer.get("alpha", 1.0)
+    try:
+        pct = int(round(float(alpha_val) * 100))
+    except (TypeError, ValueError):
+        pct = 100
+    if not isinstance(hex_val, str) or not hex_val:
+        return []
+    return [
+        (f"--{name}", f"color-mix(in srgb, {hex_val} {pct}%, transparent)"),
+        (f"--{name}-base", hex_val),
+        (f"--{name}-alpha", str(alpha_val)),
+    ]
+
+
+def _theme_bootstrap_css_vars(theme: Dict[str, Any]) -> list:
+    """Full ``:root`` variable set for a normalised user theme — the Python
+    mirror of ``themeVars()`` in ``web/src/themes/themeVars.ts``.
+
+    Returns ``[(css_var, value), ...]`` in the same order the frontend emits
+    (palette, typography, layout, color overrides, series colors, assets,
+    component styles) so the first paint is byte-identical to what
+    ``applyTheme()`` sets once the bundle loads. Keep the two in step —
+    ``tests/hermes_cli/test_web_server.py::TestThemeBootstrapCSS`` guards
+    the names the bundle actually consumes.
+    """
+    out: list = []
+
+    # Palette (background / midground / foreground layers).
+    palette = theme.get("palette") or {}
+    for name in ("background", "midground", "foreground"):
+        out.extend(_theme_layer_css_vars(name, palette.get(name)))
+
+    # Typography.
+    typo = theme.get("typography") or {}
+    if typo.get("fontSans"):
+        out.append(("--theme-font-sans", typo["fontSans"]))
+    if typo.get("fontMono"):
+        out.append(("--theme-font-mono", typo["fontMono"]))
+    out.append(
+        ("--theme-font-display", typo.get("fontDisplay") or typo.get("fontSans") or "")
+    )
+    if typo.get("baseSize"):
+        out.append(("--theme-base-size", typo["baseSize"]))
+    if typo.get("lineHeight"):
+        out.append(("--theme-line-height", typo["lineHeight"]))
+    if typo.get("letterSpacing"):
+        out.append(("--theme-letter-spacing", typo["letterSpacing"]))
+
+    # Layout.
+    layout = theme.get("layout") or {}
+    if layout.get("radius"):
+        out.append(("--radius", layout["radius"]))
+        out.append(("--theme-radius", layout["radius"]))
+    density = layout.get("density")
+    if density in _THEME_DENSITY_MULTIPLIERS:
+        out.append(("--theme-spacing-mul", _THEME_DENSITY_MULTIPLIERS[density]))
+        out.append(("--theme-density", density))
+
+    # Color overrides (``--color-*`` shadcn tokens).
+    overrides = theme.get("colorOverrides") or {}
+    for key, css_var in _THEME_OVERRIDE_KEY_TO_VAR.items():
+        val = overrides.get(key)
+        if isinstance(val, str) and val:
+            out.append((css_var, val))
+
+    # Data-series accents.
+    series = theme.get("seriesColors") or {}
+    for key, css_var in _THEME_SERIES_KEY_TO_VAR.items():
+        val = series.get(key)
+        if isinstance(val, str) and val:
+            out.append((css_var, val))
+
+    # Assets (named + custom) — values wrapped in url() like the frontend.
+    def _wrap_asset(v: str) -> str:
+        trimmed = v.strip()
+        if not trimmed:
+            return ""
+        if re.match(r"^(url\(|linear-gradient|radial-gradient|conic-gradient|none$)", trimmed, re.I):
+            return trimmed
+        return 'url("' + trimmed.replace('"', '\\"') + '")'
+
+    assets = theme.get("assets") or {}
+    for key in _THEME_NAMED_ASSET_KEYS:
+        val = assets.get(key)
+        if isinstance(val, str) and val.strip():
+            out.append((f"--theme-asset-{key}", _wrap_asset(val)))
+            out.append((f"--theme-asset-{key}-raw", val))
+    custom_assets = assets.get("custom") or {}
+    if isinstance(custom_assets, dict):
+        for key, val in custom_assets.items():
+            if not (isinstance(val, str) and val.strip()):
+                continue
+            if not re.fullmatch(r"[a-zA-Z0-9_-]+", str(key)):
+                continue
+            out.append((f"--theme-asset-custom-{key}", _wrap_asset(val)))
+            out.append((f"--theme-asset-custom-{key}-raw", val))
+
+    # Component styles (``--component-<bucket>-<kebab-prop>``).
+    component_styles = theme.get("componentStyles") or {}
+    for bucket in _THEME_COMPONENT_BUCKETS:
+        props = component_styles.get(bucket)
+        if not isinstance(props, dict):
+            continue
+        for prop, value in props.items():
+            if not (isinstance(value, str) and value.strip()):
+                continue
+            if not re.fullmatch(r"[a-zA-Z0-9_-]+", str(prop)):
+                continue
+            out.append((f"--component-{bucket}-{_theme_camel_to_kebab(prop)}", value))
+
+    return out
+
+
+# Density → spacing multiplier. Mirrors ``DENSITY_MULTIPLIERS`` in
+# ``web/src/themes/themeVars.ts``.
+_THEME_DENSITY_MULTIPLIERS = {"compact": "0.85", "comfortable": "1", "spacious": "1.2"}
+
+# camelCase color-override key → ``--color-*`` CSS var. Mirrors
+# ``OVERRIDE_KEY_TO_VAR`` in ``web/src/themes/themeVars.ts``.
+_THEME_OVERRIDE_KEY_TO_VAR = {
+    "card": "--color-card",
+    "cardForeground": "--color-card-foreground",
+    "popover": "--color-popover",
+    "popoverForeground": "--color-popover-foreground",
+    "primary": "--color-primary",
+    "primaryForeground": "--color-primary-foreground",
+    "secondary": "--color-secondary",
+    "secondaryForeground": "--color-secondary-foreground",
+    "muted": "--color-muted",
+    "mutedForeground": "--color-muted-foreground",
+    "accent": "--color-accent",
+    "accentForeground": "--color-accent-foreground",
+    "destructive": "--color-destructive",
+    "destructiveForeground": "--color-destructive-foreground",
+    "success": "--color-success",
+    "warning": "--color-warning",
+    "border": "--color-border",
+    "input": "--color-input",
+    "ring": "--color-ring",
+}
+
+# Data-series accent key → CSS var. Mirrors ``SERIES_KEY_TO_VAR``.
+_THEME_SERIES_KEY_TO_VAR = {
+    "inputTokenAccent": "--series-input-token",
+    "outputTokenAccent": "--series-output-token",
+}
+
+
 def _render_active_theme_bootstrap_css() -> str:
     """Critical-CSS shim for the active user theme.
 
-    Returns a ``<style>`` block with the ``:root`` CSS variables that
-    ``ThemeProvider.applyTheme()`` installs once the
-    ``/api/dashboard/themes`` round-trip completes.  The goal is to
-    eliminate the green flash where the first paint shows the bundle's
-    default Hermes Teal canvas before the SPA flips the configured user
-    theme into place.
+    Returns a ``<style>`` block carrying the FULL ``:root`` CSS variable set
+    that ``ThemeProvider.applyTheme()`` installs (palette, typography,
+    layout, color overrides, series colors, assets, component styles) plus
+    the theme's ``customCSS``.  The goal is to eliminate the flash where the
+    first paint shows the bundle's default Hermes Teal before the SPA flips
+    the configured user theme into place.
 
-    Built-in themes return an empty string — their full definitions live
-    in ``web/src/themes/presets.ts`` and are applied by the bundle
-    before paint, so no shim is needed for them.
+    The variable mapping is a mirror of ``themeVars()`` in
+    ``web/src/themes/themeVars.ts`` — keep them in step (guarded by
+    ``TestThemeBootstrapCSS``). The ``html,body`` canvas rule references the
+    same variables instead of literals so runtime theme switches stay live:
+    ``applyTheme()`` writes these vars as inline styles on
+    ``documentElement``, which outrank this stylesheet block in the cascade.
+
+    Built-in themes return an empty string — the build-time inline
+    bootstrap script (``web/src/themes/bootstrapScript.ts``) pre-applies
+    them before first paint.
     """
     try:
         config = load_config()
         active = cfg_get(config, "dashboard", "theme", default="default")
         if not active or not isinstance(active, str):
             return ""
-        # Built-in: the bundle already owns the definition, no flash.
+        # Built-in: the inline bootstrap script already owns the definition.
         if any(b["name"] == active for b in _BUILTIN_DASHBOARD_THEMES):
             return ""
         for theme in _discover_user_themes():
             if theme.get("name") != active:
                 continue
-            palette = theme.get("palette") or {}
-            bg = palette.get("background") or {}
-            mg = palette.get("midground") or {}
-            bg_hex = bg.get("hex", "#0a0a0a") if isinstance(bg, dict) else "#0a0a0a"
-            mg_hex = mg.get("hex", "#e5e5e5") if isinstance(mg, dict) else "#e5e5e5"
-            typo = theme.get("typography") or {}
-            font_sans = typo.get("fontSans") or _THEME_DEFAULT_TYPOGRAPHY["fontSans"]
-            base_size = typo.get("baseSize") or _THEME_DEFAULT_TYPOGRAPHY["baseSize"]
             # Defensive ``</style>`` escape — current values are well-known
-            # hex/font strings, but this keeps the helper safe if it is
+            # hex/font/CSS strings, but this keeps the helper safe if it is
             # later extended to ship user-authored CSS literals.
             def _esc(s: str) -> str:
                 return str(s).replace("</", "<\\/")
-            # Variable names MUST match what the bundle actually consumes:
-            #   - ``--background-base`` / ``--midground-base`` come from
-            #     ``layerVars()`` in ``web/src/themes/context.tsx``.
-            #   - ``--theme-font-sans`` / ``--theme-base-size`` come from
-            #     ``typographyVars()`` there, and ``index.css`` applies them
-            #     via ``html{font-family:var(--theme-font-sans);
-            #     font-size:var(--theme-base-size)}``.
-            # The ``html,body`` canvas rule references the SAME variables
-            # instead of literal values so runtime theme switches stay
-            # live: ``applyTheme()`` writes these vars as inline styles on
-            # ``documentElement``, which outrank this stylesheet block in
-            # the cascade — the rule below re-resolves automatically and
-            # never goes stale when the user picks a different theme.
-            return (
-                '<style id="hermes-theme-bootstrap">'
-                ":root{"
-                f"--background-base:{_esc(bg_hex)};"
-                f"--midground-base:{_esc(mg_hex)};"
-                f"--theme-font-sans:{_esc(font_sans)};"
-                f"--theme-base-size:{_esc(base_size)};"
-                "}"
+            css_vars = _theme_bootstrap_css_vars(theme)
+            if not css_vars:
+                return ""
+            root_rule = (
+                ":root{" + "".join(f"{k}:{_esc(v)};" for k, v in css_vars) + "}"
+            )
+            parts = ['<style id="hermes-theme-bootstrap">', root_rule]
+            # The theme's raw customCSS — this is where themes that kill the
+            # default vignette/blend-mode/backdrop filler get painted, so it
+            # must ship with the shim or those re-appear for a frame.
+            custom_css = theme.get("customCSS")
+            if isinstance(custom_css, str) and custom_css.strip():
+                parts.append(_esc(custom_css))
+            # Canvas rule flows through the variables (never goes stale when
+            # applyTheme() rewrites them as inline styles at runtime).
+            parts.append(
                 "html,body{background-color:var(--background-base);"
                 "color:var(--midground-base);"
                 "font-family:var(--theme-font-sans);"
                 "font-size:var(--theme-base-size);}"
-                "</style>"
             )
+            parts.append("</style>")
+            return "".join(parts)
         return ""
     except Exception:
         _log.debug("theme bootstrap render failed", exc_info=True)
@@ -17814,12 +17971,31 @@ def mount_spa(application: FastAPI):
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
+        # Active theme name — injected so the build-time pre-paint bootstrap
+        # script (see web/src/themes/bootstrapScript.ts) can apply the
+        # correct built-in theme to :root before first paint. The server is
+        # the source of truth: it wins over the browser's localStorage, so a
+        # cleared/other-browser visit still paints the right theme. User
+        # themes carry no JS definition here (the inline script only knows
+        # built-ins) — their first paint is owned by the critical-CSS shim
+        # below instead.
+        try:
+            _theme_cfg = load_config()
+            _active_theme = cfg_get(
+                _theme_cfg, "dashboard", "theme", default="default"
+            )
+        except Exception:
+            _active_theme = "default"
+        if not isinstance(_active_theme, str) or not _active_theme:
+            _active_theme = "default"
+        active_theme_js = json.dumps(_active_theme)
         if gated:
             bootstrap_script = (
                 f"<script>"
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+                f"window.__HERMES_ACTIVE_THEME__={active_theme_js};"
                 f"</script>"
             )
         else:
@@ -17828,6 +18004,7 @@ def mount_spa(application: FastAPI):
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+                f"window.__HERMES_ACTIVE_THEME__={active_theme_js};"
                 f"</script>"
             )
         if prefix:
@@ -17840,12 +18017,13 @@ def mount_spa(application: FastAPI):
             html = html.replace('href="/ds-assets/', f'href="{prefix}/ds-assets/')
             html = html.replace('src="/ds-assets/', f'src="{prefix}/ds-assets/')
         # Theme flash mitigation: when the active theme is a user theme
-        # (``HERMES_HOME/dashboard-themes/<name>.yaml``), inject a minimal
-        # critical-CSS block so the first paint uses the target palette.
-        # Without this the SPA paints the default Hermes Teal canvas, then
-        # ``ThemeProvider`` flips the CSS variables once
-        # ``/api/dashboard/themes`` resolves.  Built-in themes are already
-        # in the bundle's ``presets.ts`` so no shim is needed for them.
+        # (``HERMES_HOME/dashboard-themes/<name>.yaml``), inject a critical-CSS
+        # block (full :root var set + the theme's customCSS) so the first
+        # paint already uses the target theme. Without this the SPA paints
+        # the default Hermes Teal canvas, then ``ThemeProvider`` flips the CSS
+        # variables once the bundle loads. Built-in themes are pre-applied by
+        # the inline bootstrap script (``__HERMES_ACTIVE_THEME__`` above), so
+        # the shim is a no-op for them.
         theme_bootstrap = _render_active_theme_bootstrap_css()
         if theme_bootstrap:
             html = html.replace("</head>", f"{theme_bootstrap}</head>", 1)
@@ -18146,6 +18324,24 @@ def _normalise_theme_definition(data: Dict[str, Any]) -> Optional[Dict[str, Any]
         else "standard"
     )
 
+    # Data-series accent colors (Analytics/Models token charts) — hex strings
+    # only, mirroring the frontend's `ThemeSeriesColors`.
+    series_out: Dict[str, str] = {}
+    series_src = data.get("seriesColors")
+    if isinstance(series_src, dict):
+        for key in ("inputTokenAccent", "outputTokenAccent"):
+            val = series_src.get(key)
+            if isinstance(val, str) and val.strip():
+                series_out[key] = val
+
+    # Embedded-terminal colors (xterm.js pane in /chat).
+    terminal_background = data.get("terminalBackground")
+    if not (isinstance(terminal_background, str) and terminal_background.strip()):
+        terminal_background = None
+    terminal_foreground = data.get("terminalForeground")
+    if not (isinstance(terminal_foreground, str) and terminal_foreground.strip()):
+        terminal_foreground = None
+
     result: Dict[str, Any] = {
         "name": name,
         "label": data.get("label") or name,
@@ -18163,6 +18359,12 @@ def _normalise_theme_definition(data: Dict[str, Any]) -> Optional[Dict[str, Any]
         result["customCSS"] = custom_css
     if component_styles:
         result["componentStyles"] = component_styles
+    if series_out:
+        result["seriesColors"] = series_out
+    if terminal_background:
+        result["terminalBackground"] = terminal_background
+    if terminal_foreground:
+        result["terminalForeground"] = terminal_foreground
     return result
 
 
